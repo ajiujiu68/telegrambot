@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram IP Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/ipbot
+ExecStart=/usr/bin/python3 main.py
+Environment="BOT_TOKEN=你的新Token"
+Environment="IPINFO_TOKEN="
+Environment="ABUSEIPDB_KEY="
+Environment="IPQS_KEY="
+Environment="PORT=8000"
+Restart=always
+RestartSec=10
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
