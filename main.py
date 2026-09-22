@@ -11,11 +11,11 @@ import asyncio
 import ipaddress
 import logging
 import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Any
 
 import httpx
+from flask import Flask
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -46,29 +46,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ============================================================
-# 健康检查 HTTP 服务（给 Koyeb / Render / Fly.io 等平台使用）
+# Flask 健康检查服务（用于 Render 保活）
 # ============================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
+app = Flask(__name__)
 
-    def log_message(self, format, *args):
-        # 关闭健康检查访问日志，避免刷屏
-        return
+@app.route('/')
+def health_check():
+    """UptimeRobot 访问此路由时返回 200 OK"""
+    return "Telegram Bot is alive and running!", 200
 
-
-def start_health_server() -> None:
+def run_flask_server() -> None:
+    """在后台线程中运行 Flask"""
     port = int(os.environ.get("PORT", "8000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("健康检查服务已启动：0.0.0.0:%s", port)
-    server.serve_forever()
-
+    # 必须绑定到 0.0.0.0，否则 Render 无法访问
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 # ============================================================
 # 数据源查询函数
@@ -92,7 +86,6 @@ async def fetch_geo(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
         logger.warning("ip-api.com 失败: %s", e)
         return {"error": str(e)}
 
-
 async def fetch_asn(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     """ASN 与网络所有者（ipinfo.io，Token 可选）"""
     if not IPINFO_TOKEN:
@@ -107,7 +100,6 @@ async def fetch_asn(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
         logger.warning("ipinfo.io 失败: %s", e)
         return {"error": str(e)}
 
-
 async def fetch_routing(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     """BGP 路由状态（RIPEstat，免费非商业）"""
     try:
@@ -121,7 +113,6 @@ async def fetch_routing(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     except Exception as e:
         logger.warning("RIPEstat 失败: %s", e)
         return {"error": str(e)}
-
 
 async def fetch_rdap(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     """注册信息（RDAP）"""
@@ -138,7 +129,6 @@ async def fetch_rdap(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     except Exception as e:
         logger.warning("RDAP 失败: %s", e)
         return {"error": str(e)}
-
 
 async def fetch_abuse(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     """滥用报告（AbuseIPDB，需要 Key）"""
@@ -157,7 +147,6 @@ async def fetch_abuse(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
         logger.warning("AbuseIPDB 失败: %s", e)
         return {"error": str(e)}
 
-
 async def fetch_ipqs(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     """欺诈评分 / 代理 / VPN / Tor（IPQualityScore，需要 Key）"""
     if not IPQS_KEY:
@@ -173,7 +162,6 @@ async def fetch_ipqs(client: httpx.AsyncClient, ip: str) -> dict[str, Any]:
     except Exception as e:
         logger.warning("IPQS 失败: %s", e)
         return {"error": str(e)}
-
 
 # ============================================================
 # 并发查询主入口
@@ -200,7 +188,6 @@ async def query_all(ip: str) -> dict[str, Any]:
             output[key] = value
     return output
 
-
 # ============================================================
 # 结果格式化
 # ============================================================
@@ -209,7 +196,6 @@ def safe(value: Any, default: str = "—") -> str:
     if value is None or value == "":
         return default
     return str(value)
-
 
 def format_result(ip: str, data: dict[str, Any]) -> str:
     geo = data.get("geo", {})
@@ -331,7 +317,6 @@ def format_result(ip: str, data: dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-
 # ============================================================
 # Telegram 处理逻辑
 # ============================================================
@@ -345,7 +330,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "示例：`8.8.8.8` 或 `2001:4860:4860::8888`"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
-
 
 async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw = (update.message.text or "").strip()
@@ -385,10 +369,8 @@ async def handle_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         plain = result.replace("*", "").replace("`", "").replace("\\", "")
         await msg.edit_text(plain)
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Update 出错", exc_info=context.error)
-
 
 # ============================================================
 # 启动
@@ -398,9 +380,11 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("请先设置环境变量 BOT_TOKEN")
 
-    # 启动健康检查 HTTP 服务（给云平台用）
-    Thread(target=start_health_server, daemon=True).start()
+    # 1. 在后台线程启动 Flask 健康检查服务（用于 Render 保活）
+    web_thread = Thread(target=run_flask_server, daemon=True)
+    web_thread.start()
 
+    # 2. 在主线程启动 Telegram 机器人
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -414,7 +398,6 @@ def main() -> None:
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
-
 
 if __name__ == "__main__":
     main()
